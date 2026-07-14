@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<title>体感切水果 · Hand Fruit Ninja</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #0b0e18; font-family: -apple-system, "PingFang SC", system-ui, sans-serif; }
+  #wrap { position: fixed; inset: 0; }
+  /* 摄像头画面镜像，铺满 */
+  #cam { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); filter: brightness(0.55) saturate(1.1); }
+  #game { position: absolute; inset: 0; width: 100%; height: 100%; }
+  #hud {
+    position: absolute; top: env(safe-area-inset-top, 12px); left: 0; right: 0;
+    display: flex; justify-content: space-between; align-items: flex-start;
+    padding: 14px 18px; pointer-events: none; z-index: 5;
+  }
+  .pill {
+    background: rgba(10,14,26,.55); backdrop-filter: blur(8px);
+    border: 1px solid rgba(255,255,255,.12); border-radius: 14px;
+    padding: 8px 14px; color: #fff;
+  }
+  .pill .label { font-size: 11px; opacity: .6; letter-spacing: .5px; }
+  .pill .val { font-size: 26px; font-weight: 700; line-height: 1.1; }
+  #combo { color: #ffd34d; }
+  #overlay {
+    position: absolute; inset: 0; z-index: 10; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; text-align: center; padding: 24px;
+    background: radial-gradient(circle at 50% 40%, rgba(20,26,44,.6), rgba(6,8,14,.95));
+    color: #fff;
+  }
+  #overlay h1 { font-size: 34px; margin-bottom: 8px; letter-spacing: 1px; }
+  #overlay p { font-size: 15px; opacity: .8; max-width: 320px; line-height: 1.6; margin-bottom: 22px; }
+  #btn {
+    pointer-events: auto; cursor: pointer;
+    background: linear-gradient(135deg,#ff5f6d,#ffc371);
+    color: #1a1200; font-weight: 800; font-size: 18px; letter-spacing: 1px;
+    border: none; border-radius: 999px; padding: 16px 42px;
+    box-shadow: 0 10px 30px rgba(255,95,109,.4);
+  }
+  #btn:active { transform: scale(.96); }
+  #status { margin-top: 18px; font-size: 13px; opacity: .55; min-height: 18px; }
+  .hidden { display: none !important; }
+  #emoji { font-size: 60px; margin-bottom: 10px; }
+  #finalScore { font-size: 20px; color:#ffd34d; margin-bottom: 4px; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <video id="cam" playsinline autoplay muted></video>
+  <canvas id="game"></canvas>
+
+  <div id="hud" class="hidden">
+    <div class="pill"><div class="label">分数 SCORE</div><div class="val" id="score">0</div></div>
+    <div class="pill"><div class="label">连击 COMBO</div><div class="val" id="combo">x0</div></div>
+    <div class="pill"><div class="label">生命 LIVES</div><div class="val" id="lives">❤❤❤</div></div>
+  </div>
+
+  <div id="overlay">
+    <div id="emoji">🍉🔪</div>
+    <h1>体感切水果</h1>
+    <p>把手举到摄像头前，用<strong>食指指尖</strong>当刀。<br/>快速划过水果就切开，别切到炸弹 💣！<br/>漏掉水果会掉生命。</p>
+    <div id="finalScore" class="hidden"></div>
+    <button id="btn">开始游戏</button>
+    <div id="status">需要 HTTPS + 允许摄像头</div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+<script>
+(() => {
+  const video = document.getElementById('cam');
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  const overlay = document.getElementById('overlay');
+  const btn = document.getElementById('btn');
+  const statusEl = document.getElementById('status');
+  const hud = document.getElementById('hud');
+  const scoreEl = document.getElementById('score');
+  const comboEl = document.getElementById('combo');
+  const livesEl = document.getElementById('lives');
+  const finalScoreEl = document.getElementById('finalScore');
+  const emojiEl = document.getElementById('emoji');
+  const titleEl = overlay.querySelector('h1');
+
+  let W = 0, H = 0, dpr = Math.min(window.devicePixelRatio || 1, 2);
+  function resize() {
+    W = window.innerWidth; H = window.innerHeight;
+    canvas.width = W * dpr; canvas.height = H * dpr;
+    canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  // ---------- 游戏状态 ----------
+  const FRUITS = ['🍉','🍎','🍊','🍋','🍓','🍇','🥝','🍑','🍍'];
+  let running = false;
+  let score = 0, combo = 0, comboTimer = 0, lives = 3;
+  let objects = [];   // 水果/炸弹
+  let particles = [];
+  let blades = [];    // 每只手的刀轨迹点 {x,y,age}
+  let handPoints = []; // 当前帧指尖位置（已转成画布坐标）
+  let lastSpawn = 0, spawnGap = 900;
+  let lastTs = 0;
+
+  function reset() {
+    score = 0; combo = 0; comboTimer = 0; lives = 3;
+    objects = []; particles = []; blades = []; handPoints = [];
+    lastSpawn = 0; spawnGap = 900;
+    updateHud();
+  }
+  function updateHud() {
+    scoreEl.textContent = score;
+    comboEl.textContent = 'x' + combo;
+    livesEl.textContent = '❤'.repeat(Math.max(0, lives)) + '·'.repeat(Math.max(0, 3 - lives));
+  }
+
+  // ---------- 生成物体 ----------
+  function spawn() {
+    const isBomb = Math.random() < 0.16;
+    const x = W * (0.15 + Math.random() * 0.7);
+    const vy = -(H * (0.0016 + Math.random() * 0.0006)); // 向上初速（px/ms）
+    const vx = (W * 0.5 - x) * 0.0006 + (Math.random() - 0.5) * 0.25;
+    objects.push({
+      x, y: H + 60, vx, vy,
+      r: Math.min(W, H) * 0.075,
+      rot: Math.random() * 6.28, vrot: (Math.random() - 0.5) * 0.12,
+      emoji: isBomb ? '💣' : FRUITS[(Math.random() * FRUITS.length) | 0],
+      bomb: isBomb, sliced: false, counted: false
+    });
+  }
+
+  function burst(x, y, color) {
+    for (let i = 0; i < 14; i++) {
+      const a = Math.random() * 6.28, s = 1 + Math.random() * 4;
+      particles.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s - 1, age: 0, life: 500 + Math.random()*300, color });
+    }
+  }
+
+  function sliceHit(o) {
+    o.sliced = true;
+    if (o.bomb) {
+      lives = 0; // 切炸弹直接结束
+      burst(o.x, o.y, '#ff5f6d');
+      navigatorVibrate(60);
+      gameOver();
+      return;
+    }
+    combo++; comboTimer = 800;
+    const gain = 1 + Math.floor(combo / 3);
+    score += gain;
+    burst(o.x, o.y, '#ffd34d');
+    navigatorVibrate(15);
+    updateHud();
+    // 切开的两半飞出
+    for (let s = -1; s <= 1; s += 2) {
+      particles.push({ x:o.x, y:o.y, vx: s*2, vy:-1, age:0, life:700, emoji:o.emoji, half:s });
+    }
+  }
+
+  function navigatorVibrate(ms){ if (navigator.vibrate) { try{ navigator.vibrate(ms);}catch(e){} } }
+
+  // ---------- 切割检测：刀尖线段 vs 水果圆 ----------
+  function segCircle(x1,y1,x2,y2,cx,cy,r){
+    const dx=x2-x1, dy=y2-y1;
+    const l2=dx*dx+dy*dy;
+    let t = l2>0 ? ((cx-x1)*dx+(cy-y1)*dy)/l2 : 0;
+    t=Math.max(0,Math.min(1,t));
+    const px=x1+t*dx, py=y1+t*dy;
+    const ddx=cx-px, ddy=cy-py;
+    return (ddx*ddx+ddy*ddy) <= r*r;
+  }
+
+  // ---------- 主循环 ----------
+  function loop(ts){
+    if(!running) return;
+    const dt = Math.min(50, ts - (lastTs||ts)); lastTs = ts;
+
+    ctx.clearRect(0,0,W,H);
+
+    // 生成
+    if (ts - lastSpawn > spawnGap) {
+      lastSpawn = ts;
+      spawn();
+      if (Math.random() < 0.3) spawn();
+      spawnGap = Math.max(500, spawnGap - 6); // 越来越快
+    }
+
+    // combo 计时
+    if (comboTimer > 0){ comboTimer -= dt; if (comboTimer<=0) combo=0, updateHud(); }
+
+    // 更新物体
+    const g = H * 0.0000032; // 重力
+    for (const o of objects){
+      o.vy += g*dt;
+      o.x += o.vx*dt; o.y += o.vy*dt; o.rot += o.vrot;
+      // 切割检测
+      if (!o.sliced){
+        for (const b of blades){
+          if (b.speed > 12 && b.px!=null){
+            if (segCircle(b.px,b.py,b.x,b.y,o.x,o.y,o.r)){ sliceHit(o); break; }
+          }
+        }
+      }
+      // 掉落漏判（未切的水果落出屏幕底部）
+      if (!o.counted && o.y - o.r > H + 40){
+        o.counted = true;
+        if (!o.sliced && !o.bomb){
+          lives--; combo=0; comboTimer=0; updateHud();
+          if (lives<=0) gameOver();
+        }
+      }
+    }
+    objects = objects.filter(o => !(o.sliced) && o.y - o.r < H + 60 || (o.sliced && false));
+    objects = objects.filter(o => o.y - o.r < H + 80 && !o.sliced);
+
+    // 画物体
+    for (const o of objects){
+      ctx.save();
+      ctx.translate(o.x,o.y); ctx.rotate(o.rot);
+      ctx.font = (o.r*2)+'px serif';
+      ctx.textAlign='center'; ctx.textBaseline='middle';
+      ctx.fillText(o.emoji,0,0);
+      ctx.restore();
+    }
+
+    // 粒子
+    for (const p of particles){
+      p.age += dt; p.x += p.vx; p.y += p.vy; p.vy += 0.15;
+      const k = 1 - p.age/p.life;
+      if (p.emoji){
+        ctx.save(); ctx.globalAlpha=Math.max(0,k); ctx.translate(p.x,p.y);
+        ctx.scale(p.half>0?1:-1,1); ctx.font='46px serif'; ctx.textAlign='center'; ctx.textBaseline='middle';
+        // 半个水果用裁剪模拟
+        ctx.beginPath(); ctx.rect(0,-40,40,80); ctx.clip();
+        ctx.fillText(p.emoji,0,0); ctx.restore();
+      } else {
+        ctx.globalAlpha=Math.max(0,k);
+        ctx.fillStyle=p.color; ctx.beginPath(); ctx.arc(p.x,p.y,3,0,6.28); ctx.fill();
+        ctx.globalAlpha=1;
+      }
+    }
+    particles = particles.filter(p => p.age < p.life);
+
+    // 画刀轨迹
+    for (const b of blades){
+      b.trail.push({x:b.x,y:b.y}); if (b.trail.length>10) b.trail.shift();
+      ctx.beginPath();
+      for (let i=0;i<b.trail.length;i++){ const t=b.trail[i]; i?ctx.lineTo(t.x,t.y):ctx.moveTo(t.x,t.y); }
+      ctx.strokeStyle = b.speed>12 ? 'rgba(120,220,255,0.95)' : 'rgba(120,220,255,0.35)';
+      ctx.lineWidth = b.speed>12 ? 8 : 4; ctx.lineCap='round'; ctx.lineJoin='round';
+      ctx.shadowColor='rgba(120,220,255,0.9)'; ctx.shadowBlur=14; ctx.stroke(); ctx.shadowBlur=0;
+      // 指尖光点
+      ctx.beginPath(); ctx.arc(b.x,b.y,10,0,6.28); ctx.fillStyle='rgba(255,255,255,0.9)'; ctx.fill();
+    }
+
+    requestAnimationFrame(loop);
+  }
+
+  // ---------- MediaPipe Hands ----------
+  let hands, camera, ready=false;
+
+  function onResults(res){
+    // 更新每只手食指指尖位置 -> 画布坐标（镜像）
+    const newPts = [];
+    if (res.multiHandLandmarks){
+      for (const lm of res.multiHandLandmarks){
+        const tip = lm[8]; // index fingertip
+        const x = (1 - tip.x) * W; // 镜像
+        const y = tip.y * H;
+        newPts.push({x,y});
+      }
+    }
+    // 匹配到 blades（简单：按索引）
+    const next = [];
+    for (let i=0;i<newPts.length;i++){
+      const prev = blades[i];
+      const px = prev? prev.x : null, py = prev? prev.y : null;
+      const speed = (px!=null)? Math.hypot(newPts[i].x-px, newPts[i].y-py) : 0;
+      next.push({ x:newPts[i].x, y:newPts[i].y, px, py, speed, trail: prev?prev.trail:[] });
+    }
+    blades = next;
+  }
+
+  async function initHands(){
+    hands = new Hands({ locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}` });
+    hands.setOptions({ maxNumHands: 2, modelComplexity: 0, minDetectionConfidence: 0.6, minTrackingConfidence: 0.5 });
+    hands.onResults(onResults);
+    camera = new Camera(video, {
+      onFrame: async () => { await hands.send({ image: video }); },
+      width: 640, height: 480, facingMode: 'user'
+    });
+    await camera.start();
+    ready = true;
+  }
+
+  // ---------- 开始 / 结束 ----------
+  async function start(){
+    btn.disabled = true;
+    statusEl.textContent = '正在启动摄像头…';
+    try{
+      if (!ready) await initHands();
+    }catch(e){
+      statusEl.textContent = '摄像头启动失败：' + (e && e.message ? e.message : e) + '（需 HTTPS + 授权）';
+      btn.disabled = false; return;
+    }
+    overlay.classList.add('hidden');
+    hud.classList.remove('hidden');
+    reset();
+    running = true; lastTs = 0;
+    requestAnimationFrame(loop);
+  }
+
+  function gameOver(){
+    if (!running) return;
+    running = false;
+    setTimeout(()=>{
+      emojiEl.textContent = '💥';
+      titleEl.textContent = '游戏结束';
+      finalScoreEl.classList.remove('hidden');
+      finalScoreEl.textContent = `最终得分 ${score}`;
+      btn.textContent = '再来一局';
+      btn.disabled = false;
+      statusEl.textContent = '';
+      overlay.classList.remove('hidden');
+      hud.classList.add('hidden');
+    }, 300);
+  }
+
+  btn.addEventListener('click', start);
+
+  // 安全上下文提示
+  if (!(window.isSecureContext)) {
+    statusEl.textContent = '⚠️ 当前非 HTTPS，Safari 会拒绝摄像头。请用 https 打开。';
+  }
+})();
+</script>
+</body>
+</html>
