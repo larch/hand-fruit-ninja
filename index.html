@@ -53,6 +53,7 @@
 
   <div id="hud" class="hidden">
     <div class="pill"><div class="label">分数 SCORE</div><div class="val" id="score">0</div></div>
+    <div class="pill" id="timePill"><div class="label">时间 TIME</div><div class="val" id="time">∞</div></div>
     <div class="pill"><div class="label">连击 COMBO</div><div class="val" id="combo">x0</div></div>
     <div class="pill"><div class="label">生命 LIVES</div><div class="val" id="lives">❤❤❤</div></div>
   </div>
@@ -81,6 +82,8 @@
   const scoreEl = document.getElementById('score');
   const comboEl = document.getElementById('combo');
   const livesEl = document.getElementById('lives');
+  const timeEl = document.getElementById('time');
+  const timePill = document.getElementById('timePill');
   const finalScoreEl = document.getElementById('finalScore');
   const emojiEl = document.getElementById('emoji');
   const titleEl = overlay.querySelector('h1');
@@ -95,38 +98,89 @@
   window.addEventListener('resize', resize);
   resize();
 
+  // ======================================================================
+  //  ⚙️  参数调节区 CONFIG —— 想改难度/手感，只动这里就够了
+  // ======================================================================
+  const CONFIG = {
+    lives: 3,              // 生命数
+
+    // —— 出果节奏（间隔越大 = 出得越慢/越少）——
+    startGap: 1700,        // 开局出果间隔(ms)，一开始一个一个慢慢来
+    minGap:   600,         // 最快时的间隔(ms)，越小越密
+    gapRampPerSec: 16,     // 每存活 1 秒，间隔缩短多少 ms（决定“变快”的速度）
+
+    // —— 水果飞行速度（向上初速，越大飞越高越快）——
+    startSpeed: 0.00105,   // 开局初速（×屏高/ms）飞得慢
+    maxSpeed:   0.00185,   // 最快初速
+    speedRampPerSec: 0.0000075, // 每秒增加多少初速
+    speedRandom: 0.00035,  // 每个水果的随机浮动
+    gravity: 0.0000030,    // 重力（越大回落越快、滞空越短）
+
+    fruitSize: 0.075,      // 水果半径（×屏幕短边）
+
+    // —— 同时出果数量（后期才变多，前期永远一个一个）——
+    doubleAtSec: 28,       // 多少秒后开始偶尔出两个
+    tripleAtSec: 55,       // 多少秒后偶尔出三个
+    multiChance: 0.35,     // 进入多果阶段后，一次多出的概率
+
+    // —— 炸弹 ——
+    bombFreeSec: 12,       // 前若干秒是新手保护，绝不出炸弹
+    bombChance:  0.14,     // 之后每个物体是炸弹的概率
+
+    sliceSpeed: 12,        // 指尖切割速度阈值(px/帧)，越小越灵敏
+  };
+  // ======================================================================
+
   // ---------- 游戏状态 ----------
   const FRUITS = ['🍉','🍎','🍊','🍋','🍓','🍇','🥝','🍑','🍍'];
   let running = false;
-  let score = 0, combo = 0, comboTimer = 0, lives = 3;
+  let score = 0, combo = 0, comboTimer = 0, lives = CONFIG.lives;
   let objects = [];   // 水果/炸弹
   let particles = [];
   let blades = [];    // 每只手的刀轨迹点 {x,y,age}
   let handPoints = []; // 当前帧指尖位置（已转成画布坐标）
-  let lastSpawn = 0, spawnGap = 900;
+  let lastSpawn = 0;
   let lastTs = 0;
+  let startTime = 0, elapsed = 0; // elapsed = 本局已进行秒数（驱动难度）
 
   function reset() {
-    score = 0; combo = 0; comboTimer = 0; lives = 3;
+    score = 0; combo = 0; comboTimer = 0; lives = CONFIG.lives;
     objects = []; particles = []; blades = []; handPoints = [];
-    lastSpawn = 0; spawnGap = 900;
+    lastSpawn = 0; startTime = 0; elapsed = 0;
     updateHud();
   }
+  function fmtTime(s){ const m=(s/60)|0, ss=(s%60)|0; return m+':'+(ss<10?'0':'')+ss; }
   function updateHud() {
     scoreEl.textContent = score;
     comboEl.textContent = 'x' + combo;
-    livesEl.textContent = '❤'.repeat(Math.max(0, lives)) + '·'.repeat(Math.max(0, 3 - lives));
+    timeEl.textContent = fmtTime(elapsed);
+    livesEl.textContent = '❤'.repeat(Math.max(0, lives)) + '·'.repeat(Math.max(0, CONFIG.lives - lives));
+  }
+
+  // 当前难度：出果间隔（随时间变短）
+  function currentGap(){
+    return Math.max(CONFIG.minGap, CONFIG.startGap - elapsed * CONFIG.gapRampPerSec);
+  }
+  // 当前难度：飞行初速系数（随时间变快）
+  function currentSpeed(){
+    return Math.min(CONFIG.maxSpeed, CONFIG.startSpeed + elapsed * CONFIG.speedRampPerSec);
+  }
+  // 当前一次出几个果（前期恒为 1，后期偶尔 2~3）
+  function currentBatch(){
+    if (elapsed >= CONFIG.tripleAtSec && Math.random() < CONFIG.multiChance) return 3;
+    if (elapsed >= CONFIG.doubleAtSec && Math.random() < CONFIG.multiChance) return 2;
+    return 1;
   }
 
   // ---------- 生成物体 ----------
   function spawn() {
-    const isBomb = Math.random() < 0.16;
+    const isBomb = elapsed >= CONFIG.bombFreeSec && Math.random() < CONFIG.bombChance;
     const x = W * (0.15 + Math.random() * 0.7);
-    const vy = -(H * (0.0016 + Math.random() * 0.0006)); // 向上初速（px/ms）
+    const vy = -(H * (currentSpeed() + Math.random() * CONFIG.speedRandom)); // 向上初速（px/ms）
     const vx = (W * 0.5 - x) * 0.0006 + (Math.random() - 0.5) * 0.25;
     objects.push({
       x, y: H + 60, vx, vy,
-      r: Math.min(W, H) * 0.075,
+      r: Math.min(W, H) * CONFIG.fruitSize,
       rot: Math.random() * 6.28, vrot: (Math.random() - 0.5) * 0.12,
       emoji: isBomb ? '💣' : FRUITS[(Math.random() * FRUITS.length) | 0],
       bomb: isBomb, sliced: false, counted: false
@@ -177,30 +231,35 @@
   // ---------- 主循环 ----------
   function loop(ts){
     if(!running) return;
+    if (!startTime) startTime = ts;
     const dt = Math.min(50, ts - (lastTs||ts)); lastTs = ts;
+
+    // 已进行秒数 -> 驱动难度 + HUD 计时
+    const prevSec = elapsed|0;
+    elapsed = (ts - startTime) / 1000;
+    if ((elapsed|0) !== prevSec) updateHud();
 
     ctx.clearRect(0,0,W,H);
 
-    // 生成
-    if (ts - lastSpawn > spawnGap) {
+    // 生成：间隔随时间变短；前期一次一个，后期偶尔多个
+    if (ts - lastSpawn > currentGap()) {
       lastSpawn = ts;
-      spawn();
-      if (Math.random() < 0.3) spawn();
-      spawnGap = Math.max(500, spawnGap - 6); // 越来越快
+      const n = currentBatch();
+      for (let k = 0; k < n; k++) spawn();
     }
 
     // combo 计时
     if (comboTimer > 0){ comboTimer -= dt; if (comboTimer<=0) combo=0, updateHud(); }
 
     // 更新物体
-    const g = H * 0.0000032; // 重力
+    const g = H * CONFIG.gravity; // 重力
     for (const o of objects){
       o.vy += g*dt;
       o.x += o.vx*dt; o.y += o.vy*dt; o.rot += o.vrot;
       // 切割检测
       if (!o.sliced){
         for (const b of blades){
-          if (b.speed > 12 && b.px!=null){
+          if (b.speed > CONFIG.sliceSpeed && b.px!=null){
             if (segCircle(b.px,b.py,b.x,b.y,o.x,o.y,o.r)){ sliceHit(o); break; }
           }
         }
@@ -250,8 +309,8 @@
       b.trail.push({x:b.x,y:b.y}); if (b.trail.length>10) b.trail.shift();
       ctx.beginPath();
       for (let i=0;i<b.trail.length;i++){ const t=b.trail[i]; i?ctx.lineTo(t.x,t.y):ctx.moveTo(t.x,t.y); }
-      ctx.strokeStyle = b.speed>12 ? 'rgba(120,220,255,0.95)' : 'rgba(120,220,255,0.35)';
-      ctx.lineWidth = b.speed>12 ? 8 : 4; ctx.lineCap='round'; ctx.lineJoin='round';
+      ctx.strokeStyle = b.speed>CONFIG.sliceSpeed ? 'rgba(120,220,255,0.95)' : 'rgba(120,220,255,0.35)';
+      ctx.lineWidth = b.speed>CONFIG.sliceSpeed ? 8 : 4; ctx.lineCap='round'; ctx.lineJoin='round';
       ctx.shadowColor='rgba(120,220,255,0.9)'; ctx.shadowBlur=14; ctx.stroke(); ctx.shadowBlur=0;
       // 指尖光点
       ctx.beginPath(); ctx.arc(b.x,b.y,10,0,6.28); ctx.fillStyle='rgba(255,255,255,0.9)'; ctx.fill();
@@ -321,7 +380,7 @@
       emojiEl.textContent = '💥';
       titleEl.textContent = '游戏结束';
       finalScoreEl.classList.remove('hidden');
-      finalScoreEl.textContent = `最终得分 ${score}`;
+      finalScoreEl.textContent = `最终得分 ${score} · 存活 ${fmtTime(elapsed)}`;
       btn.textContent = '再来一局';
       btn.disabled = false;
       statusEl.textContent = '';
