@@ -141,12 +141,12 @@
   let handPoints = []; // 当前帧指尖位置（已转成画布坐标）
   let lastSpawn = 0;
   let lastTs = 0;
-  let startTime = 0, elapsed = 0; // elapsed = 本局已进行秒数（驱动难度）
+  let startTime = 0, elapsed = 0, elapsedBase = 0; // elapsed = 本局已进行秒数（驱动难度）
 
   function reset() {
     score = 0; combo = 0; comboTimer = 0; lives = CONFIG.lives;
     objects = []; particles = []; blades = []; handPoints = [];
-    lastSpawn = 0; startTime = 0; elapsed = 0;
+    lastSpawn = 0; startTime = 0; elapsed = 0; elapsedBase = 0;
     updateHud();
   }
   function fmtTime(s){ const m=(s/60)|0, ss=(s%60)|0; return m+':'+(ss<10?'0':'')+ss; }
@@ -234,9 +234,9 @@
     if (!startTime) startTime = ts;
     const dt = Math.min(50, ts - (lastTs||ts)); lastTs = ts;
 
-    // 已进行秒数 -> 驱动难度 + HUD 计时
+    // 已进行秒数 -> 驱动难度 + HUD 计时（elapsedBase 支持暂停续玩）
     const prevSec = elapsed|0;
-    elapsed = (ts - startTime) / 1000;
+    elapsed = elapsedBase + (ts - startTime) / 1000;
     if ((elapsed|0) !== prevSec) updateHud();
 
     ctx.clearRect(0,0,W,H);
@@ -320,7 +320,7 @@
   }
 
   // ---------- MediaPipe Hands ----------
-  let hands, camera, ready=false;
+  let hands, camera, camActive=false, paused=false;
 
   function onResults(res){
     // 更新每只手食指指尖位置 -> 画布坐标（镜像）
@@ -345,15 +345,30 @@
   }
 
   async function initHands(){
+    if (hands) return;
     hands = new Hands({ locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}` });
     hands.setOptions({ maxNumHands: 2, modelComplexity: 0, minDetectionConfidence: 0.6, minTrackingConfidence: 0.5 });
     hands.onResults(onResults);
+  }
+
+  // 真正释放摄像头：停 MediaPipe 送帧循环 + 停掉所有轨道（指示灯灭、权限交还）
+  function stopCamera(){
+    try { if (camera) camera.stop(); } catch(e){}
+    const s = video.srcObject;
+    if (s && s.getTracks) { s.getTracks().forEach(t => { try{ t.stop(); }catch(e){} }); }
+    video.srcObject = null;
+    camActive = false;
+  }
+
+  async function startCamera(){
+    await initHands();
+    // 每次重新拿一个新流并新建 Camera，避免复用已停止的轨道
     camera = new Camera(video, {
       onFrame: async () => { await hands.send({ image: video }); },
       width: 640, height: 480, facingMode: 'user'
     });
     await camera.start();
-    ready = true;
+    camActive = true;
   }
 
   // ---------- 开始 / 结束 ----------
@@ -361,7 +376,7 @@
     btn.disabled = true;
     statusEl.textContent = '正在启动摄像头…';
     try{
-      if (!ready) await initHands();
+      await startCamera();
     }catch(e){
       statusEl.textContent = '摄像头启动失败：' + (e && e.message ? e.message : e) + '（需 HTTPS + 授权）';
       btn.disabled = false; return;
@@ -376,6 +391,7 @@
   function gameOver(){
     if (!running) return;
     running = false;
+    stopCamera(); // 游戏结束就交还摄像头
     setTimeout(()=>{
       emojiEl.textContent = '💥';
       titleEl.textContent = '游戏结束';
@@ -390,6 +406,41 @@
   }
 
   btn.addEventListener('click', start);
+
+  // ---------- 切走标签页 / 隐藏 → 释放摄像头；切回来自动恢复 ----------
+  async function pauseGame(){
+    if (!running || paused) return;
+    paused = true;
+    running = false;
+    elapsedBase = elapsed;   // 冻结难度进度
+    startTime = 0;
+    stopCamera();            // 真正关掉摄像头，交还权限、灭指示灯
+    statusEl.textContent = '';
+  }
+  async function resumeGame(){
+    if (!paused) return;
+    try{
+      await startCamera();
+    }catch(e){
+      // 恢复失败（比如权限被撤）→ 回到开始界面
+      paused = false;
+      overlay.classList.remove('hidden'); hud.classList.add('hidden');
+      titleEl.textContent = '摄像头已暂停';
+      statusEl.textContent = '点“继续”重新授权摄像头';
+      btn.textContent = '继续'; btn.disabled = false;
+      return;
+    }
+    paused = false;
+    running = true; lastTs = 0;
+    requestAnimationFrame(loop);
+  }
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) pauseGame();
+    else if (paused) resumeGame();
+  });
+  window.addEventListener('pagehide', stopCamera);
+  window.addEventListener('beforeunload', stopCamera);
 
   // 安全上下文提示
   if (!(window.isSecureContext)) {
